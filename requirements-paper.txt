@@ -1,0 +1,18 @@
+# Reference Linux/CUDA environment for the arXiv v3 reproduction profile.
+# The paper explicitly reports only vLLM 0.5.5. The remaining pins form a
+# compatible, auditable stack for this repository and are not claimed as the
+# authors' unpublished original versions.
+torch==2.4.0
+transformers==4.44.2
+peft==0.12.0
+accelerate==0.34.2
+bitsandbytes==0.43.3
+trl==0.11.4
+datasets==2.21.0
+vllm==0.5.5
+spacy==3.7.6
+numpy==1.26.4
+scikit-learn==1.5.1
+tqdm==4.66.5
+wandb==0.17.8
+pytest==8.3.2

@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""
-EXIT RAG Pipeline Quickstart
-This script demonstrates an end-to-end RAG pipeline using EXIT for context compression.
+"""End-to-end EXIT compression and reader pipeline.
+
+Retrieval is intentionally external: callers provide already retrieved
+documents so the same pipeline can be used with paper retrieval artifacts or
+with an application-specific retriever.
 """
 
 import time
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+import warnings
 
-import spacy
 import torch
-from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from compressors import EXITCompressor, SearchResult
+from compressors.baselines.exit.core import build_qa_prompt
 
-@dataclass
+
+@dataclass(frozen=True)
 class Document:
-    """Container for document content."""
+    """Retrieved document supplied to the EXIT pipeline."""
 
     title: str
     text: str
@@ -24,237 +28,199 @@ class Document:
 
 
 class ExitRAG:
-    """End-to-end Retrieval-Augmented Generation with EXIT compression."""
+    """EXIT compression followed by an instruction-tuned reader."""
 
     def __init__(
         self,
-        retriever_model: str = "google/gemma-2b-it",
+        compression_base_model: str = "google/gemma-2b-it",
         compression_model: str = "doubleyyh/exit-gemma-2b",
         reader_model: str = "meta-llama/Llama-3.1-8B-Instruct",
-        device: str = "cuda",
-    ):
-        # Initialize models
-        print("Loading models...")
+        device: Optional[str] = None,
+        batch_size: int = 8,
+        threshold: float = 0.5,
+        cache_dir: str = "./cache",
+        compression_base_revision: Optional[str] = None,
+        compression_revision: Optional[str] = None,
+        reader_revision: Optional[str] = None,
+        load_compressor_in_4bit: bool = True,
+        max_new_tokens: int = 100,
+        retriever_model: Optional[str] = None,
+    ) -> None:
+        """Load the paper compressor and downstream reader.
 
-        # Initialize EXIT compression model
-        base_model = AutoModelForCausalLM.from_pretrained(
-            retriever_model,
-            device_map="auto",
-            torch_dtype=torch.float16,
+        ``retriever_model`` is retained as a deprecated alias for
+        ``compression_base_model``.  Earlier versions used that misleading name
+        even though this class never performs retrieval.
+        """
+
+        if retriever_model is not None:
+            warnings.warn(
+                "retriever_model is deprecated; use compression_base_model. "
+                "ExitRAG receives retrieved documents and does not load a retriever.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            compression_base_model = retriever_model
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+
+        print("Loading EXIT compressor and reader...")
+        self.compressor = EXITCompressor(
+            base_model=compression_base_model,
+            checkpoint=compression_model,
+            device=device,
+            cache_dir=cache_dir,
+            base_revision=compression_base_revision,
+            checkpoint_revision=compression_revision,
+            batch_size=batch_size,
+            threshold=threshold,
+            load_in_4bit=load_compressor_in_4bit,
         )
-        self.exit_model = PeftModel.from_pretrained(base_model, compression_model)
-        self.exit_model.eval()
-        self.exit_tokenizer = AutoTokenizer.from_pretrained(retriever_model)
-        self.yes_token_id = self._single_token_id("Yes")
-        self.no_token_id = self._single_token_id("No")
 
-        # Initialize reader model
+        reader_kwargs = {
+            "cache_dir": cache_dir,
+            "device_map": "auto" if device is None else {"": device},
+            "revision": reader_revision,
+        }
+        if device is None or not str(device).startswith("cpu"):
+            reader_kwargs["torch_dtype"] = torch.float16
         self.reader = AutoModelForCausalLM.from_pretrained(
             reader_model,
-            device_map="auto",
+            **reader_kwargs,
         )
         self.reader.eval()
-        self.reader_tokenizer = AutoTokenizer.from_pretrained(reader_model)
-
-        # Initialize sentence splitter
-        self.nlp = spacy.load(
-            "en_core_web_sm",
-            disable=["tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer", "ner"],
+        self.reader_tokenizer = AutoTokenizer.from_pretrained(
+            reader_model,
+            cache_dir=cache_dir,
+            revision=reader_revision,
         )
-        self.nlp.enable_pipe("senter")
+        if self.reader_tokenizer.pad_token_id is None:
+            self.reader_tokenizer.pad_token = self.reader_tokenizer.eos_token
 
-        self.device = device
-
-    def _single_token_id(self, label: str) -> int:
-        """Return the token ID for a single-token classifier label."""
-
-        token_ids = self.exit_tokenizer.encode(label, add_special_tokens=False)
-        if len(token_ids) != 1:
-            raise ValueError(
-                f'Expected classifier label "{label}" to map to one token, '
-                f"but got token IDs {token_ids}."
-            )
-        return token_ids[0]
+        self.reader_device = next(self.reader.parameters()).device
+        self.max_new_tokens = max_new_tokens
+        self.last_compression_time = 0.0
+        self.last_compression_result = None
 
     @staticmethod
-    def _compression_prompt(query: str, context: str, sentence: str) -> str:
-        """Build the prompt used by the EXIT sentence classifier."""
+    def _synchronize_cuda() -> None:
+        """Make wall-clock latency include queued CUDA work."""
 
-        return f"""<start_of_turn>user
-Query:
-{query}
-Full context:
-{context}
-Sentence:
-{sentence}
-Is this sentence useful in answering the query? Answer only "Yes" or "No".<end_of_turn>
-<start_of_turn>model
-"""
+        if torch.cuda.is_available():
+            for device_index in range(torch.cuda.device_count()):
+                torch.cuda.synchronize(device_index)
 
-    def get_sentence_relevance(
-        self,
-        query: str,
-        context: str,
-        sentence: str,
-        threshold: float = 0.5,
-    ) -> Tuple[bool, float]:
-        """Determine whether a sentence is relevant using the EXIT model."""
-
-        prompt = self._compression_prompt(query, context, sentence)
-        inputs = self.exit_tokenizer(prompt, return_tensors="pt")
-
-        max_length = getattr(self.exit_model.config, "max_position_embeddings", None)
-        input_length = inputs["input_ids"].shape[-1]
-        if max_length is not None and input_length > max_length:
-            raise ValueError(
-                f"EXIT compression prompt is {input_length} tokens, exceeding the "
-                f"model limit of {max_length}. Score each sentence against only its "
-                "containing document; do not concatenate all retrieved documents into "
-                "one classifier context."
+    @staticmethod
+    def _as_search_results(documents: List[Document]) -> List[SearchResult]:
+        return [
+            SearchResult(
+                evi_id=index,
+                docid=index,
+                title=document.title,
+                text=document.text,
+                score=document.score,
             )
-
-        inputs = inputs.to(self.exit_model.device)
-
-        with torch.no_grad():
-            outputs = self.exit_model(**inputs)
-            logits = outputs.logits[
-                0,
-                -1,
-                [self.yes_token_id, self.no_token_id],
-            ]
-            relevance_probability = torch.softmax(logits, dim=0)[0].item()
-
-        return relevance_probability >= threshold, relevance_probability
+            for index, document in enumerate(documents)
+        ]
 
     def compress_documents(
         self,
         query: str,
         documents: List[Document],
-        threshold: float = 0.5,
+        threshold: Optional[float] = None,
     ) -> Tuple[str, List[bool], List[float]]:
-        """Compress documents using EXIT.
+        """Split, batch-score, and reassemble retrieved documents."""
 
-        Each candidate sentence is scored against its own containing document,
-        matching the paper and the classifier's training data. Prompts may be
-        batched for throughput, but contexts must remain document-local.
-        """
+        self._synchronize_cuda()
+        started_at = time.perf_counter()
+        result = self.compressor.compress_with_details(
+            query=query,
+            documents=self._as_search_results(documents),
+            threshold=threshold,
+        )
+        self._synchronize_cuda()
+        self.last_compression_time = time.perf_counter() - started_at
+        self.last_compression_result = result
 
-        start_time = time.time()
-
-        compressed_documents = []
-        relevance_scores = []
-        selections = []
-        total_sentences = 0
-        selected_sentence_count = 0
-
-        for document in documents:
-            document_text = document.text.strip()
-            document_context = (
-                f"{document.title}\n{document_text}" if document.title else document_text
-            )
-            sentences = [
-                sent.text.strip()
-                for sent in self.nlp(document_text).sents
-                if sent.text.strip()
-            ]
-            total_sentences += len(sentences)
-
-            selected_in_document = []
-            for sentence in sentences:
-                is_relevant, score = self.get_sentence_relevance(
-                    query=query,
-                    context=document_context,
-                    sentence=sentence,
-                    threshold=threshold,
-                )
-                selections.append(is_relevant)
-                relevance_scores.append(score)
-                if is_relevant:
-                    selected_in_document.append(sentence)
-                    selected_sentence_count += 1
-
-            if selected_in_document:
-                compressed_documents.append(" ".join(selected_in_document))
-
-        compressed_text = "\n\n".join(compressed_documents)
-
-        compression_time = time.time() - start_time
-        print(f"Compression time: {compression_time:.2f}s")
-        print(f"Compressed {selected_sentence_count}/{total_sentences} sentences")
-
-        return compressed_text, selections, relevance_scores
+        print(f"Compression time: {self.last_compression_time:.2f}s")
+        print(
+            f"Compressed {len(result.selected_sentences)}/{len(result.sentences)} sentences"
+        )
+        return result.text, list(result.selections), list(result.scores)
 
     def generate_answer(self, query: str, context: str) -> Tuple[str, float]:
-        """Generate an answer using the compressed context."""
+        """Generate an answer with the paper's Table 7 reader prompt."""
 
-        start_time = time.time()
-
-        # Format prompt
-        chat = [
-            {
-                "role": "system",
-                "content": (
-                    "Context information is below.\n"
-                    "---------------------\n"
-                    f"{context}\n"
-                    "---------------------\n"
-                    "Given the context information and not prior knowledge, answer "
-                    "the query. Do not provide any explanation."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Query: {query}\nAnswer: ",
-            },
-        ]
-
+        self._synchronize_cuda()
+        started_at = time.perf_counter()
+        prompt_content = build_qa_prompt(query=query, context=context)
         prompt = self.reader_tokenizer.apply_chat_template(
-            chat,
+            [{"role": "user", "content": prompt_content}],
             tokenize=False,
             add_generation_prompt=True,
         )
+        inputs = self.reader_tokenizer(prompt, return_tensors="pt")
 
-        # Generate answer
-        inputs = self.reader_tokenizer(
-            prompt,
-            return_tensors="pt",
-        ).to(self.device)
+        limits = []
+        model_limit = getattr(self.reader.config, "max_position_embeddings", None)
+        if isinstance(model_limit, int) and model_limit > 0:
+            limits.append(model_limit)
+        tokenizer_limit = getattr(self.reader_tokenizer, "model_max_length", None)
+        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 10**9:
+            limits.append(tokenizer_limit)
+        reader_limit = min(limits) if limits else None
+        required_tokens = inputs.input_ids.size(1) + self.max_new_tokens
+        if reader_limit is not None and required_tokens > reader_limit:
+            raise ValueError(
+                f"reader prompt plus max_new_tokens requires {required_tokens} "
+                f"tokens, exceeding the reader limit of {reader_limit}"
+            )
+        inputs = inputs.to(self.reader_device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.reader.generate(
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,
-                max_new_tokens=100,
-                pad_token_id=self.reader_tokenizer.eos_token_id,
+                max_new_tokens=self.max_new_tokens,
+                pad_token_id=self.reader_tokenizer.pad_token_id,
+                eos_token_id=self.reader_tokenizer.eos_token_id,
                 do_sample=False,
             )
+        self._synchronize_cuda()
 
         answer = self.reader_tokenizer.decode(
             outputs[0][inputs.input_ids.size(1) :],
             skip_special_tokens=True,
         ).strip()
-
-        generation_time = time.time() - start_time
-
-        return answer, generation_time
+        reading_time = time.perf_counter() - started_at
+        return answer, reading_time
 
     def run_rag(
         self,
         query: str,
         documents: List[Document],
-        compression_threshold: float = 0.5,
+        compression_threshold: Optional[float] = None,
     ) -> dict:
-        """Run the complete RAG pipeline with compression."""
+        """Run compression and reading while reporting paper latency fields."""
 
-        # 1. Compress documents
         compressed_text, selections, scores = self.compress_documents(
-            query,
-            documents,
-            compression_threshold,
+            query=query,
+            documents=documents,
+            threshold=compression_threshold,
         )
+        answer, reading_time = self.generate_answer(query, compressed_text)
 
-        # 2. Generate answer
-        answer, generation_time = self.generate_answer(query, compressed_text)
+        original_context = "\n\n".join(
+            f"{document.title}\n{document.text}" if document.title else document.text
+            for document in documents
+        )
+        original_tokens = len(
+            self.reader_tokenizer.encode(original_context, add_special_tokens=False)
+        )
+        compressed_tokens = len(
+            self.reader_tokenizer.encode(compressed_text, add_special_tokens=False)
+        )
+        details = self.last_compression_result
 
         return {
             "query": query,
@@ -262,41 +228,42 @@ Is this sentence useful in answering the query? Answer only "Yes" or "No".<end_o
             "answer": answer,
             "sentence_selections": selections,
             "relevance_scores": scores,
-            "generation_time": generation_time,
+            "sentences": list(details.sentences),
+            "sentence_document_indices": list(details.document_indices),
+            "sentence_indices": list(details.sentence_indices),
+            "original_tokens": original_tokens,
+            "compressed_tokens": compressed_tokens,
+            "compression_time": self.last_compression_time,
+            "reading_time": reading_time,
+            "generation_time": reading_time,
+            "total_time": self.last_compression_time + reading_time,
         }
 
 
-def main():
-    """Demonstrate usage of the EXIT RAG pipeline."""
+def main() -> None:
+    """Run the small example used in the README."""
 
-    # Initialize pipeline
     rag = ExitRAG()
-
-    # Example query and documents
     query = "How do solid-state drives (SSDs) improve computer performance?"
     documents = [
         Document(
             title="Computer Storage Technologies",
-            text="""
-            Solid-state drives use flash memory to store data without moving parts.
-            Unlike traditional hard drives, SSDs have no mechanical components.
-            The absence of physical movement allows for much faster data access speeds.
-            I bought my computer last week.
-            SSDs significantly reduce boot times and application loading speeds.
-            They consume less power and are more reliable than mechanical drives.
-            The price of SSDs has decreased significantly in recent years.
-            """,
+            text=(
+                "Solid-state drives use flash memory to store data without moving parts. "
+                "Unlike traditional hard drives, SSDs have no mechanical components. "
+                "The absence of physical movement allows for much faster data access speeds. "
+                "I bought my computer last week. "
+                "SSDs significantly reduce boot times and application loading speeds. "
+                "They consume less power and are more reliable than mechanical drives. "
+                "The price of SSDs has decreased significantly in recent years."
+            ),
         )
     ]
-
-    # Run pipeline
     result = rag.run_rag(query, documents)
-
-    # Print results
     print("\nQuery:", result["query"])
     print("\nCompressed Context:", result["compressed_context"])
     print("\nAnswer:", result["answer"])
-    print(f"\nGeneration Time: {result['generation_time']:.2f}s")
+    print(f"\nTotal Time: {result['total_time']:.2f}s")
 
 
 if __name__ == "__main__":

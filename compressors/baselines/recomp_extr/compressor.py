@@ -4,7 +4,7 @@ import torch
 from typing import List
 from transformers import AutoTokenizer
 from ...base import BaseCompressor, SearchResult
-from contriever import Contriever
+from .contriever import Contriever
 
 
 class RecompExtractiveCompressor(BaseCompressor):

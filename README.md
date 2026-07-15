@@ -1,200 +1,183 @@
-# EXIT: Context-Aware Extractive Compression for RAG 🚀
+# EXIT: Context-Aware Extractive Compression for RAG
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![arXiv](https://img.shields.io/badge/arXiv-2412.12559-b31b1b.svg)](https://arxiv.org/abs/2412.12559)
 
-Official implementation of "EXIT: Context-Aware Extractive Compression for Enhancing Retrieval-Augmented Generation"
+Official implementation of **EXIT: Context-Aware Extractive Compression for
+Enhancing Retrieval-Augmented Generation**.
 
-## Overview 📋
-
-EXIT is a context-aware extractive compression framework that improves both the effectiveness and efficiency of Retrieval-Augmented Generation (RAG) by:
-
-- 🎯 Preserving critical information while reducing context size
-- 🔍 Considering full document context when evaluating sentence importance
-- ⚡ Enabling parallelizable, context-aware extraction
-- 🎚️ Adapting dynamically to query complexity
-- ⚖️ Balancing compression ratio and answer accuracy
-
-## Installation 💻
-
-```bash
-# Clone the repository
-git clone https://github.com/ThisIsHwang/EXIT.git
-cd EXIT
-
-# Create a new conda environment
-conda create -n exit python=3.8
-conda activate exit
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Download spaCy model
-python -m spacy download en_core_web_sm
-```
-
-## Quickstart 🚀
-
-Here's a simple example demonstrating the EXIT RAG pipeline:
-
-```python
-from exit_rag import ExitRAG, Document
-
-# Initialize pipeline
-rag = ExitRAG(
-    retriever_model="google/gemma-2b-it",
-    compression_model="doubleyyh/exit-gemma-2b",
-    reader_model="meta-llama/Llama-3.1-8B-Instruct"
-)
-
-# Example query and document
-query = "How do solid-state drives (SSDs) improve computer performance?"
-documents = [Document(
-    title="Computer Storage Technologies",
-    text="""
-    Solid-state drives use flash memory to store data without moving parts.
-    Unlike traditional hard drives, SSDs have no mechanical components.
-    The absence of physical movement allows for much faster data access speeds.
-    I bought my computer last week.
-    SSDs significantly reduce boot times and application loading speeds.
-    They consume less power and are more reliable than mechanical drives.
-    The price of SSDs has decreased significantly in recent years.
-    """
-)]
-
-# Run RAG pipeline with compression
-result = rag.run_rag(query, documents)
-
-# Print results
-print("\nQuery:", result["query"])
-print("\nCompressed Context:", result["compressed_context"])
-print("\nAnswer:", result["answer"])
-print(f"\nGeneration Time: {result['generation_time']:.2f}s")
-```
-
-### Multi-document compression
-
-For Top-k retrieval, classify every candidate sentence with **only the document
-that contains that sentence** as its `Full context`. Do not concatenate all Top-k
-documents into one compressor prompt. The prompts can still be batched for
-parallel inference, but each prompt should represent `(query, containing
-document, candidate sentence)`, matching the paper and the classifier's
-training data.
-
-`google/gemma-2b-it` plus the EXIT adapter is the compressor.
-`Llama-3.1-8B-Instruct` is the downstream reader and does not produce the
-sentence relevance scores.
-
-Compute the relevance score from the exact classifier-label logits:
+EXIT splits each retrieved document into sentences, scores every sentence with
+its complete containing document as context, and keeps sentences whose
+normalized `Yes` probability passes a threshold. Selected sentences are
+reassembled in their original document and sentence order.
 
 ```text
-P(Yes) / (P(Yes) + P(No))
+retrieved document -> sentence candidates -> batched Yes/No scoring -> ordered context
+                                          P(Yes)
+score = ----------------------------------------------------------------
+        P(Yes) + P(No) over the two exact next-token classifier labels
 ```
 
-Do not estimate this score from only the tokens that happen to appear in a
-Top-k generated-logprob list. If neither `Yes` nor `No` is present in that list,
-the model has left the expected binary output format and the sample should be
-diagnosed rather than interpreted as a relevance decision.
+## Installation
 
-Do not silently truncate compressor prompts. The candidate sentence and the
-`Answer only "Yes" or "No"` instruction appear after `Full context`; right-side
-truncation can remove both and make the model continue the passage instead of
-classifying the sentence. The provided implementations now raise an error when
-one document exceeds the compressor context window.
+For normal development:
 
-### Reproducing the paper
+```bash
+conda create -n exit python=3.10
+conda activate exit
+pip install -r requirements.txt
+```
 
-The paper evaluates TriviaQA on its **test split** and reports the standard
-Top-5 and Top-20 retrieval settings. A TriviaQA development split or Top-50
-retrieval is a useful extension, but it is not a like-for-like reproduction of
-the reported table. For larger retrieval depths, keep the compressor prompts
-document-local and combine selected sentences only after classification.
+For a Linux/CUDA paper run, `requirements-paper.txt` provides an auditable
+reference stack:
 
-## Data Preparation 📚
+```bash
+pip install -r requirements-paper.txt
+```
 
-### Download Datasets
+The paper explicitly reports vLLM 0.5.5 but does not publish the other package
+versions. The remaining pins in that file are a compatible repository profile,
+not a claim about the authors' original environment.
 
-You can download the evaluation datasets (NaturalQuestions, TriviaQA, HotpotQA, 2WikiMultiHopQA) from the [CompAct repository](https://github.com/dmis-lab/CompAct).
+The released Llama readers are gated Hugging Face models, so accept their
+licenses and authenticate before running the example.
 
-### Dataset Structure
+## Quickstart
 
-Each dataset follows the format:
+`ExitRAG` accepts already retrieved documents. It does not load a retriever.
+
+```python
+from exit_rag import Document, ExitRAG
+
+rag = ExitRAG(
+    compression_base_model="google/gemma-2b-it",
+    compression_model="doubleyyh/exit-gemma-2b",
+    reader_model="meta-llama/Llama-3.1-8B-Instruct",
+    batch_size=8,
+)
+
+query = "How do solid-state drives improve computer performance?"
+documents = [
+    Document(
+        title="Computer Storage Technologies",
+        text=(
+            "Solid-state drives use flash memory without moving parts. "
+            "They provide faster data access and reduce boot and loading times. "
+            "I bought my computer last week."
+        ),
+    )
+]
+
+result = rag.run_rag(query, documents)
+print(result["compressed_context"])
+print(result["answer"])
+print(result["compression_time"], result["reading_time"], result["total_time"])
+```
+
+The compressor batches sentence prompts, but each prompt contains only the
+candidate's source document. It never concatenates all Top-k documents into
+`Full context`. A document that exceeds the Gemma context window raises an
+error rather than silently truncating the candidate sentence or classifier
+instruction.
+
+## Reproducing the paper setup
+
+The immutable reference settings and all items not reported by the paper are in
+[`configs/paper_v3.json`](configs/paper_v3.json). The primary evaluation setup
+is:
+
+| Component | Paper setting |
+|---|---|
+| Retriever | Contriever-MSMARCO |
+| Corpus | December 2018 Wikipedia dump |
+| Retrieval depths | Top-5 and Top-20 |
+| Compressor | Gemma-2B-it + EXIT adapter, 4-bit/float16 |
+| Threshold | 0.5 |
+| Readers | Llama-3.1-8B-Instruct and Llama-3.1-70B-Instruct |
+| Splits | NQ dev, TriviaQA test, HotpotQA dev, 2WikiMultiHopQA dev |
+| Metrics | EM, F1, token count, compression/read/total latency |
+
+The repository runner starts from pre-retrieved CompAct-style JSON or JSONL:
 
 ```json
 {
-    "question": "How do solid-state drives improve computer performance?",
-    "ctxs": [
-        {
-            "title": "Document Title",
-            "text": "Document content...",
-            "score": 1.0
-        },
-        ...
-    ]
+  "question": "Who wrote the novel?",
+  "answers": ["Example Author"],
+  "ctxs": [
+    {"title": "Document title", "text": "Document text", "score": 12.3}
+  ]
 }
 ```
 
-## Model Details 🔧
+Validate an artifact without loading models:
 
-- **Base Model**: Gemma-2b-it
-- **Training Method**: PEFT/LoRA
-- **Training Data**: HotpotQA dataset with:
-  - Positive examples: Sentences marked as supporting facts
-  - Hard negatives: Sentences from same documents but not supporting facts
-  - Random negatives: Sentences from unrelated documents
-- **Recommended Parameters**:
-  - Compression threshold (tau): 0.5
-  - Cache directory: Configurable via initialization
-
-## Key Features 🌟
-
-### Document Compression
-
-```python
-compressed_text, selections, scores = rag.compress_documents(
-    query=query,
-    documents=documents,
-    threshold=0.5  # Adjustable compression threshold
-)
+```bash
+python reproduce.py \
+  --input data/hotpotqa-dev.jsonl \
+  --output results/hotpotqa-top5.jsonl \
+  --dataset hotpotqa \
+  --top-k 5 \
+  --validate-only
 ```
 
-### Answer Generation
+Run compression and QA:
 
-```python
-answer, generation_time = rag.generate_answer(
-    query=query,
-    context=compressed_text
-)
+```bash
+python reproduce.py \
+  --input data/hotpotqa-dev.jsonl \
+  --output results/hotpotqa-top5.jsonl \
+  --dataset hotpotqa \
+  --top-k 5 \
+  --latency-repeats 5
 ```
 
-### Complete RAG Pipeline
+Raw predictions and sentence decisions are written to the requested JSONL. A
+neighboring `*.summary.json` records metrics, token retention, per-stage
+latency, input SHA-256, Git SHA, requested/resolved model revisions, and the
+runtime environment.
 
-```python
-result = rag.run_rag(
-    query=query,
-    documents=documents,
-    compression_threshold=0.5
-)
+The runner currently uses Transformers. The paper's latency numbers use vLLM
+0.5.5 and therefore must not be compared directly with these timings. Retrieval
+latency is excluded because the paper's reported end-to-end table measures
+compression plus reader generation.
+
+### Important reproduction limits
+
+The paper does not report exact dataset/index/model revisions, the retrieval
+index construction parameters, random seed, spaCy pipeline/version, LoRA target
+modules, quantization subtype, maximum sequence length, or reader stopping
+configuration. Pin these values and retain the generated manifests for any
+strict comparison. The v3 paper also contains a few result-table differences,
+so report confidence intervals and raw artifacts rather than only one headline
+number.
+
+## Training the compressor
+
+The training pipeline uses HotpotQA supporting-fact annotations:
+
+- positive: supporting-fact sentence;
+- hard negative: another sentence in the same supporting document;
+- random negative: a sentence paired with a different query;
+- target ratio: `positive : hard negative : random negative = 2 : 1 : 1`.
+
+Training retains HotpotQA's supplied sentence arrays so supporting-fact indices
+stay aligned; inference uses spaCy's rule-based sentencizer. This is recorded in
+the dataset manifest because the paper does not publish the exact alignment
+procedure used between those two representations.
+
+See [`train/README.md`](train/README.md) for deterministic data preparation,
+paper hyperparameters, checkpointing, and classifier evaluation commands.
+
+## Tests
+
+```bash
+pytest -q
 ```
 
-## Performance 📊
+The regression suite fixes the paper-critical behavior: document-local context,
+batched sentence scoring, exact Yes/No normalization, no silent overflow,
+original-order reassembly, and the valid empty-compression case.
 
-EXIT demonstrates superior performance in:
-- Token count reduction
-- Answer accuracy preservation
-- End-to-end latency reduction
-- Multi-hop question handling
-
-## Limitations ⚠️
-
-- Currently optimized for English text only
-- No support for cross-lingual compression
-- Requires GPU for optimal performance
-- The exact end-to-end evaluation runner used for the paper is not yet included
-
-## Citation 📚
-
-If you use EXIT in your research, please cite our paper:
+## Citation
 
 ```bibtex
 @article{hwang2024exit,
@@ -204,13 +187,3 @@ If you use EXIT in your research, please cite our paper:
   year={2024}
 }
 ```
-
-## License 📄
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
-## Contact 📧
-
-For questions or issues:
-- Open an issue in this repository
-- Contact: doubleyyh@kaist.ac.kr

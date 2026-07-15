@@ -1,0 +1,80 @@
+{
+  "paper": {
+    "arxiv_id": "2412.12559v3",
+    "published_pdf_date": "2025-05-29",
+    "retrieval_latency_included": false
+  },
+  "retrieval": {
+    "model": "facebook/contriever-msmarco",
+    "corpus": "Wikipedia December 2018 dump",
+    "top_k": [5, 20],
+    "model_revision": null,
+    "index_revision": null
+  },
+  "datasets": {
+    "nq": "dev",
+    "triviaqa": "test",
+    "hotpotqa": "dev",
+    "2wiki": "dev"
+  },
+  "compressor": {
+    "base_model": "google/gemma-2b-it",
+    "adapter": "doubleyyh/exit-gemma-2b",
+    "base_revision": null,
+    "adapter_revision": null,
+    "threshold": 0.5,
+    "sentence_splitter": "spacy.lang.en.English/sentencizer",
+    "quantization_bits": 4,
+    "compute_dtype": "float16",
+    "prompt_overflow_policy": "error",
+    "document_context_scope": "containing_document"
+  },
+  "training": {
+    "dataset": "HotpotQA train",
+    "positive": 213000,
+    "hard_negative": 107000,
+    "random_negative": 107000,
+    "validation_positive": 2400,
+    "validation_hard_negative": 1200,
+    "validation_random_negative": 1200,
+    "sentence_boundaries": "HotpotQA-provided arrays retained for supporting-fact index alignment",
+    "per_device_batch_size": 8,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 1e-5,
+    "weight_decay": 0.1,
+    "warmup_ratio": 0.03,
+    "epochs": 1,
+    "optimizer": "paged_adamw_8bit",
+    "lora_rank": 64,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "seed": null
+  },
+  "reader": {
+    "models": [
+      "meta-llama/Llama-3.1-8B-Instruct",
+      "meta-llama/Llama-3.1-70B-Instruct"
+    ],
+    "model_revisions": null,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_new_tokens": null
+  },
+  "latency": {
+    "paper_backend": "vLLM 0.5.5",
+    "repeats": 5,
+    "warmup_runs": null,
+    "cuda_synchronize": true
+  },
+  "not_reported_by_paper": [
+    "random seed",
+    "exact model and dataset revisions",
+    "retrieval index construction parameters",
+    "spaCy version and pipeline",
+    "LoRA target modules",
+    "NF4 versus FP4 and double-quantization choice",
+    "maximum sequence length and overflow policy",
+    "reader maximum output length and stop tokens",
+    "latency warm-up procedure"
+  ]
+}
