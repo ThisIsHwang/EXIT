@@ -1,212 +1,248 @@
 """EXIT implementation for context-aware extractive compression."""
 
+from itertools import groupby
+from typing import List, Optional, Tuple
+
 import torch
-from typing import List, Tuple
+from peft import PeftConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel, PeftConfig
-from torch.cuda.amp import autocast
-import numpy as np
-from functools import lru_cache
+
 from ...base import BaseCompressor, SearchResult
+
 
 class EXITCompressor(BaseCompressor):
     """EXIT: Context-aware extractive compression."""
-    
+
     def __init__(
         self,
         base_model: str = "google/gemma-2b-it",
-        checkpoint: str = None,
-        device: str = None,
+        checkpoint: Optional[str] = None,
+        device: Optional[str] = None,
         cache_dir: str = "./cache",
         batch_size: int = 8,
-        threshold: float = 0.5
+        threshold: float = 0.5,
     ):
-        """Initialize EXIT compressor.
-        
+        """Initialize the EXIT compressor.
+
         Args:
-            base_model: Base model path
-            checkpoint: Path to trained checkpoint
-            device: Device to use (None for auto)
-            cache_dir: Cache directory for models
-            batch_size: Batch size for processing
-            threshold: Confidence threshold for selection
+            base_model: Base causal language model used by the classifier.
+            checkpoint: EXIT PEFT adapter path or Hugging Face model ID.
+            device: Device or device map passed to Transformers. ``None`` uses auto.
+            cache_dir: Directory for downloaded model files.
+            batch_size: Number of sentence-classification prompts per forward pass.
+            threshold: Minimum normalized ``Yes`` probability for sentence retention.
         """
         self.batch_size = batch_size
         self.threshold = threshold
-        
-        # Initialize tokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_model,
-            use_fast=True
+            use_fast=True,
+            cache_dir=cache_dir,
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
-        
-        # Load model
+
         model_kwargs = {
             "device_map": "auto" if device is None else device,
             "torch_dtype": torch.float16,
             "load_in_4bit": True,
             "cache_dir": cache_dir,
-            "max_length": 4096,
         }
-        
         self.base_model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            **model_kwargs
+            **model_kwargs,
         )
-        
+
         if checkpoint:
             self.peft_config = PeftConfig.from_pretrained(checkpoint)
             self.model = PeftModel.from_pretrained(
                 self.base_model,
-                checkpoint
+                checkpoint,
             )
         else:
             self.model = self.base_model
-            
-        # Prepare model
+
         self.model.eval()
-        if hasattr(self.model, 'half'):
-            self.model.half()
-            
-        # Cache device and token IDs
         self.device = next(self.model.parameters()).device
-        self.yes_token_id = self.tokenizer.encode(
-            "Yes",
-            add_special_tokens=False
-        )[0]
-        self.no_token_id = self.tokenizer.encode(
-            "No",
-            add_special_tokens=False
-        )[0]
-        
-        # Clear GPU memory
+        self.yes_token_id = self._single_token_id("Yes")
+        self.no_token_id = self._single_token_id("No")
+        self.max_input_tokens = self._resolve_max_input_tokens()
+
         torch.cuda.empty_cache()
-    
-    @lru_cache(maxsize=1024)
-    def _generate_prompt(
-        self,
-        query: str,
-        context: str,
-        sentence: str
-    ) -> str:
-        """Generate prompt for relevance classification."""
+
+    def _single_token_id(self, label: str) -> int:
+        """Return the token ID for a single-token classifier label."""
+        token_ids = self.tokenizer.encode(label, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f'Expected classifier label "{label}" to map to one token, '
+                f"but got token IDs {token_ids}."
+            )
+        return token_ids[0]
+
+    def _resolve_max_input_tokens(self) -> Optional[int]:
+        """Resolve a usable model/tokenizer context-window limit."""
+        limits = []
+
+        model_limit = getattr(self.model.config, "max_position_embeddings", None)
+        if isinstance(model_limit, int) and model_limit > 0:
+            limits.append(model_limit)
+
+        tokenizer_limit = getattr(self.tokenizer, "model_max_length", None)
+        # Hugging Face uses very large sentinel values when no tokenizer limit is set.
+        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 10**9:
+            limits.append(tokenizer_limit)
+
+        return min(limits) if limits else None
+
+    @staticmethod
+    def _generate_prompt(query: str, context: str, sentence: str) -> str:
+        """Generate the prompt used for sentence relevance classification."""
         return (
-            f'<start_of_turn>user\n'
-            f'Query:\n{query}\n'
-            f'Full context:\n{context}\n'
-            f'Sentence:\n{sentence}\n'
-            f'Is this sentence useful in answering the query? '
-            f'Answer only "Yes" or "No".<end_of_turn>\n'
-            f'<start_of_turn>model\n'
+            "<start_of_turn>user\n"
+            f"Query:\n{query}\n"
+            f"Full context:\n{context}\n"
+            f"Sentence:\n{sentence}\n"
+            'Is this sentence useful in answering the query? '
+            'Answer only "Yes" or "No".<end_of_turn>\n'
+            "<start_of_turn>model\n"
         )
-    
+
     def _predict_batch(
         self,
         queries: List[str],
         contexts: List[str],
-        sentences: List[str]
+        sentences: List[str],
     ) -> Tuple[List[str], torch.Tensor]:
-        """Predict relevance for a batch of sentences."""
+        """Predict relevance for a batch without silently truncating prompts."""
         prompts = [
             self._generate_prompt(query, context, sentence)
-            for query, context, sentence
-            in zip(queries, contexts, sentences)
+            for query, context, sentence in zip(queries, contexts, sentences)
         ]
-        
-        with torch.cuda.amp.autocast():
-            inputs = self.tokenizer(
-                prompts,
-                return_tensors='pt',
-                padding=True,
-                truncation=True,
-                max_length=4096,
-                return_attention_mask=True
-            )
-            
-            inputs = {
-                k: v.to(self.device, non_blocking=True)
-                for k, v in inputs.items()
-            }
-            
-            with torch.no_grad(), torch.cuda.amp.autocast():
-                outputs = self.model(**inputs)
-                
-                next_token_logits = outputs.logits[:, -1, :]
-                relevant_logits = torch.stack([
+
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+            return_attention_mask=True,
+        )
+
+        prompt_lengths = inputs["attention_mask"].sum(dim=1)
+        if self.max_input_tokens is not None:
+            too_long = prompt_lengths > self.max_input_tokens
+            if torch.any(too_long):
+                longest = int(prompt_lengths.max().item())
+                raise ValueError(
+                    f"EXIT compression prompt is {longest} tokens, exceeding the "
+                    f"model limit of {self.max_input_tokens}. Each sentence must be "
+                    "scored against only its containing document. For an unusually "
+                    "long single document, split or chunk that document explicitly "
+                    "instead of relying on tokenizer truncation."
+                )
+
+        inputs = {
+            key: value.to(self.device, non_blocking=True)
+            for key, value in inputs.items()
+        }
+
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            outputs = self.model(**inputs)
+            next_token_logits = outputs.logits[:, -1, :]
+            label_logits = torch.stack(
+                [
                     next_token_logits[:, self.yes_token_id],
-                    next_token_logits[:, self.no_token_id]
-                ], dim=1)
-                
-                probs = torch.softmax(relevant_logits, dim=1)
-                predictions = [
-                    "Yes" if p else "No"
-                    for p in probs.argmax(dim=1).cpu().numpy()
-                ]
-        
-        return predictions, probs
-    
+                    next_token_logits[:, self.no_token_id],
+                ],
+                dim=1,
+            )
+            probabilities = torch.softmax(label_logits, dim=1)
+
+        predictions = [
+            "Yes" if label_index == 0 else "No"
+            for label_index in probabilities.argmax(dim=1).cpu().tolist()
+        ]
+        return predictions, probabilities
+
+    @staticmethod
+    def _document_groups(
+        documents: List[SearchResult],
+    ) -> List[List[SearchResult]]:
+        """Group consecutive sentence records that belong to one document."""
+        return [
+            list(group)
+            for _, group in groupby(documents, key=lambda document: document.evi_id)
+        ]
+
     def compress(
         self,
         query: str,
-        documents: List[SearchResult]
+        documents: List[SearchResult],
     ) -> List[SearchResult]:
-        """Compress documents using context-aware extraction.
-        
-        Args:
-            query: Input question
-            documents: List of documents to compress
-            
-        Returns:
-            List containing single SearchResult with compressed text
+        """Compress sentence records with document-local classifier contexts.
+
+        ``documents`` is expected to contain sentence-level ``SearchResult`` records,
+        with consecutive records sharing an ``evi_id`` belonging to the same source
+        document. Every candidate sentence is classified against the title and full
+        text of that source document, never against a concatenation of all retrieved
+        documents.
         """
-        # Prepare full context
-        context = "\n".join(
-            f"{doc.title}\n{doc.text}"
-            for doc in documents
-        )
-        
-        selected_texts = []
-        current_doc_id = None
-        current_texts = []
-        
-        # Process each document while maintaining order
-        for doc in documents:
-            # Start new document
-            if current_doc_id != doc.evi_id:
-                if current_texts:
-                    doc_text = " ".join(current_texts)
-                    if doc_text.strip():
-                        selected_texts.append(doc_text)
-                current_doc_id = doc.evi_id
-                current_texts = []
-            
-            # Get predictions for current document
-            predictions, probs = self._predict_batch(
-                [query],
-                [context],
-                [doc.text]
+        if not documents:
+            return []
+
+        groups = self._document_groups(documents)
+        candidate_records = []
+
+        for group_index, group in enumerate(groups):
+            title = group[0].title.strip() if group[0].title else ""
+            sentence_texts = [
+                record.text.strip()
+                for record in group
+                if record.text and record.text.strip()
+            ]
+            document_text = " ".join(sentence_texts)
+            document_context = (
+                f"{title}\n{document_text}" if title else document_text
             )
-            
-            # Add text if above threshold
-            if probs[0, 0].item() >= self.threshold:
-                current_texts.append(doc.text)
-        
-        # Add last document if exists
-        if current_texts:
-            doc_text = " ".join(current_texts)
-            if doc_text.strip():
-                selected_texts.append(doc_text)
-        
-        # Combine all selected texts
-        compressed_text = "\n\n".join(selected_texts)
-        
-        # Return compressed result
-        return [SearchResult(
-            evi_id=0,
-            docid=0,
-            title="",
-            text=compressed_text,
-            score=1.0
-        )]
+
+            for record in group:
+                sentence = record.text.strip() if record.text else ""
+                if sentence:
+                    candidate_records.append(
+                        (group_index, document_context, sentence)
+                    )
+
+        selected_by_group: List[List[str]] = [[] for _ in groups]
+
+        for start in range(0, len(candidate_records), self.batch_size):
+            batch = candidate_records[start : start + self.batch_size]
+            _, probabilities = self._predict_batch(
+                [query] * len(batch),
+                [item[1] for item in batch],
+                [item[2] for item in batch],
+            )
+
+            for (group_index, _, sentence), probability in zip(
+                batch,
+                probabilities[:, 0].detach().cpu().tolist(),
+            ):
+                if probability >= self.threshold:
+                    selected_by_group[group_index].append(sentence)
+
+        compressed_documents = [
+            " ".join(selected_sentences)
+            for selected_sentences in selected_by_group
+            if selected_sentences
+        ]
+        compressed_text = "\n\n".join(compressed_documents)
+
+        return [
+            SearchResult(
+                evi_id=0,
+                docid=0,
+                title="",
+                text=compressed_text,
+                score=1.0,
+            )
+        ]
