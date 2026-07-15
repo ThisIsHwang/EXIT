@@ -71,6 +71,31 @@ print("\nCompressed Context:", result["compressed_context"])
 print("\nAnswer:", result["answer"])
 print(f"\nGeneration Time: {result['generation_time']:.2f}s")
 ```
+
+### Multi-document compression
+
+For Top-k retrieval, classify every candidate sentence with **only the document
+that contains that sentence** as its `Full context`. Do not concatenate all Top-k
+documents into one compressor prompt. The prompts can still be batched for
+parallel inference, but each prompt should represent `(query, containing
+document, candidate sentence)`, matching the paper and the classifier's
+training data.
+
+`google/gemma-2b-it` plus the EXIT adapter is the compressor.
+`Llama-3.1-8B-Instruct` is the downstream reader and does not produce the
+sentence relevance scores.
+
+Compute the relevance score from the exact classifier-label logits:
+
+```text
+P(Yes) / (P(Yes) + P(No))
+```
+
+Do not estimate this score from only the tokens that happen to appear in a
+Top-k generated-logprob list. If neither `Yes` nor `No` is present in that list,
+the model has left the expected binary output format and the sample should be
+diagnosed rather than interpreted as a relevance decision.
+
 ## Data Preparation 📚
 
 ### Download Datasets
