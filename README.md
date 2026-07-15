@@ -96,6 +96,20 @@ Top-k generated-logprob list. If neither `Yes` nor `No` is present in that list,
 the model has left the expected binary output format and the sample should be
 diagnosed rather than interpreted as a relevance decision.
 
+Do not silently truncate compressor prompts. The candidate sentence and the
+`Answer only "Yes" or "No"` instruction appear after `Full context`; right-side
+truncation can remove both and make the model continue the passage instead of
+classifying the sentence. The provided implementations now raise an error when
+one document exceeds the compressor context window.
+
+### Reproducing the paper
+
+The paper evaluates TriviaQA on its **test split** and reports the standard
+Top-5 and Top-20 retrieval settings. A TriviaQA development split or Top-50
+retrieval is a useful extension, but it is not a like-for-like reproduction of
+the reported table. For larger retrieval depths, keep the compressor prompts
+document-local and combine selected sentences only after classification.
+
 ## Data Preparation 📚
 
 ### Download Datasets
@@ -107,29 +121,17 @@ You can download the evaluation datasets (NaturalQuestions, TriviaQA, HotpotQA, 
 Each dataset follows the format:
 
 ```json
-
 {
-
     "question": "How do solid-state drives improve computer performance?",
-
     "ctxs": [
-
         {
-
             "title": "Document Title",
-
             "text": "Document content...",
-
             "score": 1.0
-
         },
-
         ...
-
     ]
-
 }
-
 ```
 
 ## Model Details 🔧
@@ -188,6 +190,7 @@ EXIT demonstrates superior performance in:
 - Currently optimized for English text only
 - No support for cross-lingual compression
 - Requires GPU for optimal performance
+- The exact end-to-end evaluation runner used for the paper is not yet included
 
 ## Citation 📚
 
